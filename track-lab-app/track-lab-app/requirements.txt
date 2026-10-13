@@ -1,4 +1,0 @@
-librosa
-numpy
-mutagen
-soundfile
