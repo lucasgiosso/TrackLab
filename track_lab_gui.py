@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""Track Lab con ventana: elegí una carpeta, revisá la vista previa y renombrá."""
+import multiprocessing, os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+import csv, queue, threading, tkinter as tk
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+
+import track_lab as core
+
+PATTERNS = ["Tono - BPM - Título", "Título [Tono BPM]", "BPM - Tono - Título"]
+
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Track Lab")
+        self.geometry("1020x580")
+        self.rows, self.errors, self.folder, self.q = [], [], None, queue.Queue()
+
+        top = ttk.Frame(self, padding=10); top.pack(fill="x")
+        self.b_pick = ttk.Button(top, text="Elegir carpeta…", command=self.pick); self.b_pick.pack(side="left")
+        self.b_files = ttk.Button(top, text="Elegir archivos…", command=self.pick_files); self.b_files.pack(side="left", padx=(6, 0))
+        self.lbl = ttk.Label(top, text="Ninguna carpeta elegida"); self.lbl.pack(side="left", padx=10)
+        ttk.Button(top, text="Deshacer…", command=self.undo).pack(side="right")
+
+        opt = ttk.Frame(self, padding=(10, 0)); opt.pack(fill="x")
+        self.pat = ttk.Combobox(opt, state="readonly", width=24, values=PATTERNS)
+        self.pat.current(0); self.pat.pack(side="left")
+        self.pat.bind("<<ComboboxSelected>>", lambda e: self.refresh())
+        self.rec, self.tags, self.wtags = tk.BooleanVar(), tk.BooleanVar(value=True), tk.BooleanVar()
+        ttk.Checkbutton(opt, text="Subcarpetas", variable=self.rec).pack(side="left", padx=8)
+        ttk.Checkbutton(opt, text="Usar tags ID3", variable=self.tags).pack(side="left", padx=8)
+        ttk.Checkbutton(opt, text="Escribir BPM y tono en el archivo", variable=self.wtags).pack(side="left", padx=8)
+
+        cols = (("orig", "Original", 280), ("tono", "Tono", 80), ("bpm", "BPM", 60),
+                ("estilo", "Estilo probable", 170), ("nuevo", "Nombre nuevo", 370))
+        self.tree = ttk.Treeview(self, columns=[c[0] for c in cols], show="headings")
+        for k, t, w in cols:
+            self.tree.heading(k, text=t); self.tree.column(k, width=w, anchor="w")
+        self.tree.pack(fill="both", expand=True, padx=10, pady=10)
+
+        bot = ttk.Frame(self, padding=(10, 0, 10, 10)); bot.pack(fill="x")
+        self.prog = ttk.Progressbar(bot, length=300); self.prog.pack(side="left")
+        self.status = ttk.Label(bot, text="Un «?» junto al tono marca baja confianza"); self.status.pack(side="left", padx=10)
+        self.b_apply = ttk.Button(bot, text="Renombrar", command=self.apply, state="disabled")
+        self.b_apply.pack(side="right")
+        self.after(100, self.poll)
+
+    def pick(self):
+        d = filedialog.askdirectory(title="Elegí la carpeta con tus tracks (los archivos no se ven acá, es normal)")
+        if not d: return
+        self.folder = Path(d); self.lbl.config(text=str(self.folder))
+
+        def scan(rec):
+            it = self.folder.rglob("*") if rec else self.folder.glob("*")
+            return sorted(p for p in it if p.is_file() and p.suffix.lower() in core.EXT)
+        files = scan(self.rec.get())
+        if not files and not self.rec.get():
+            files = scan(True)  # si no hay audios arriba, busca en subcarpetas
+            if files: self.rec.set(True)
+        if not files:
+            allf = [p for p in self.folder.rglob("*") if p.is_file()]
+            exts = sorted({p.suffix.lower() for p in allf})[:8]
+            messagebox.showinfo("Track Lab", f"No encontré audios compatibles.\nArchivos en la carpeta: {len(allf)}\n"
+                                f"Extensiones vistas: {', '.join(exts) or 'ninguna'}\n"
+                                f"Compatibles: {', '.join(sorted(core.EXT))}")
+            return
+        self.start(files)
+
+    def pick_files(self):
+        fs = filedialog.askopenfilenames(title="Elegí tus tracks", filetypes=[
+            ("Audio", "*.mp3 *.wav *.flac *.m4a *.aif *.aiff *.ogg"), ("Todos", "*.*")])
+        if not fs: return
+        files = sorted(Path(f) for f in fs)
+        self.folder = files[0].parent
+        self.lbl.config(text=f"{len(files)} archivos en {self.folder}")
+        self.start(files)
+
+    def start(self, files):
+        self.rows.clear(); self.errors.clear(); self.tree.delete(*self.tree.get_children())
+        self.prog.config(maximum=len(files), value=0)
+        for b in (self.b_pick, self.b_files, self.b_apply): b.state(["disabled"])
+        threading.Thread(target=self.work, args=(files,), daemon=True).start()
+
+    def work(self, files):
+        use_tags = self.tags.get()
+        try:
+            with ProcessPoolExecutor(max_workers=core.default_jobs()) as ex:
+                futs = {ex.submit(core.analyze_safe, str(p)): p for p in files}
+                for f in as_completed(futs):
+                    p = futs[f]
+                    try:
+                        info, err = f.result()
+                    except Exception as e:
+                        info, err = None, f"{type(e).__name__}: {e}"
+                    if err: self.q.put(("err", p, err))
+                    else: self.q.put(("row", p, core.title_from(p, use_tags), info))
+        except Exception as e:
+            self.q.put(("err", self.folder, f"{type(e).__name__}: {e}"))
+        self.q.put(("done",))
+
+    def poll(self):
+        try:
+            changed = False
+            while True:
+                m = self.q.get_nowait()
+                if m[0] == "row":
+                    self.rows.append(m[1:]); self.prog.step(1); changed = True
+                elif m[0] == "err":
+                    self.errors.append((m[1], m[2])); self.prog.step(1); changed = True
+                else:
+                    if changed: self.refresh(); changed = False
+                    self.b_pick.state(["!disabled"]); self.b_files.state(["!disabled"])
+                    self.b_apply.state(["!disabled" if self.rows else "disabled"])
+                    self.status.config(text=f"Listo: {len(self.rows)} tracks, {len(self.errors)} con error")
+                    if self.errors and not self.rows:
+                        messagebox.showerror("Track Lab", "No se pudo analizar ningún archivo.\n\nPrimer error:\n"
+                                             f"{self.errors[0][0].name}\n{self.errors[0][1][:300]}")
+        except queue.Empty:
+            pass
+        if changed:
+            self.refresh()
+            self.status.config(text=f"Analizados: {len(self.rows) + len(self.errors)}")
+        self.after(150, self.poll)
+
+    def name_for(self, r):
+        p, title, info = r
+        return core.new_name(title, info, p.suffix, self.pat.current())
+
+    def refresh(self):
+        self.rows.sort(key=lambda r: r[0].name.lower())
+        self.tree.delete(*self.tree.get_children())
+        for r in self.rows:
+            p, _, info = r
+            tono = f"{info['cam']} {info['note']}" + ("?" if info.get("kconf", 1) < 0.03 else "")
+            self.tree.insert("", "end", values=(p.name, tono, f"{info['bpm']:.1f}",
+                                                core.style(info["bpm"]), self.name_for(r)))
+        for p, err in self.errors:
+            self.tree.insert("", "end", values=(p.name, "—", "—", "ERROR", err[:90]))
+
+    def apply(self):
+        if not self.rows: return
+        if not messagebox.askyesno("Renombrar", f"Se van a renombrar {len(self.rows)} archivos. ¿Seguir?"):
+            return
+        ok = skipped = 0
+        with open(self.folder / "track_lab_log.csv", "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            for r in self.rows:
+                p, _, info = r
+                t = p.with_name(self.name_for(r))
+                try:
+                    if self.wtags.get() and core.mutagen: core.write_tags(p, info)
+                    if t != p and not t.exists():
+                        p.rename(t); w.writerow([str(p), str(t)]); ok += 1
+                    else:
+                        skipped += 1
+                except Exception:
+                    skipped += 1
+        self.rows.clear(); self.refresh(); self.b_apply.state(["disabled"])
+        messagebox.showinfo("Track Lab", f"Renombrados: {ok}\nOmitidos: {skipped}\n\nLog para deshacer: track_lab_log.csv")
+
+    def undo(self):
+        log = filedialog.askopenfilename(title="Elegí track_lab_log.csv", filetypes=[("CSV", "*.csv")])
+        if not log: return
+        n = 0
+        with open(log, newline="", encoding="utf-8") as f:
+            for old, new in csv.reader(f):
+                if Path(new).exists() and not Path(old).exists():
+                    Path(new).rename(old); n += 1
+        messagebox.showinfo("Track Lab", f"Restaurados: {n}")
+
+
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
+    App().mainloop()
