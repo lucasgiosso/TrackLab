@@ -14,7 +14,7 @@ class App(tk.Tk):
         super().__init__()
         self.title("Track Lab")
         self.geometry("1020x580")
-        self.rows, self.folder, self.q = [], None, queue.Queue()
+        self.rows, self.errors, self.folder, self.q = [], [], None, queue.Queue()
 
         top = ttk.Frame(self, padding=10); top.pack(fill="x")
         self.b_pick = ttk.Button(top, text="Elegir carpeta…", command=self.pick); self.b_pick.pack(side="left")
@@ -48,11 +48,21 @@ class App(tk.Tk):
         d = filedialog.askdirectory()
         if not d: return
         self.folder = Path(d); self.lbl.config(text=str(self.folder))
-        files = sorted(p for p in (self.folder.rglob("*") if self.rec.get() else self.folder.glob("*"))
-                       if p.suffix.lower() in core.EXT)
+        def scan(rec):
+            it = self.folder.rglob("*") if rec else self.folder.glob("*")
+            return sorted(p for p in it if p.is_file() and p.suffix.lower() in core.EXT)
+        files = scan(self.rec.get())
+        if not files and not self.rec.get():
+            files = scan(True)  # si no hay audios arriba, busca en subcarpetas
+            if files: self.rec.set(True)
         if not files:
-            messagebox.showinfo("Track Lab", "No encontré audios en esa carpeta."); return
-        self.rows.clear(); self.tree.delete(*self.tree.get_children())
+            allf = [p for p in self.folder.rglob("*") if p.is_file()]
+            exts = sorted({p.suffix.lower() for p in allf})[:8]
+            messagebox.showinfo("Track Lab", f"No encontré audios compatibles.\nArchivos en la carpeta: {len(allf)}\n"
+                                f"Extensiones vistas: {', '.join(exts) or 'ninguna'}\n"
+                                f"Compatibles: {', '.join(sorted(core.EXT))}")
+            return
+        self.rows.clear(); self.errors.clear(); self.tree.delete(*self.tree.get_children())
         self.prog.config(maximum=len(files), value=0)
         self.b_pick.state(["disabled"]); self.b_apply.state(["disabled"])
         threading.Thread(target=self.work, args=(files,), daemon=True).start()
@@ -63,7 +73,7 @@ class App(tk.Tk):
             try:
                 self.q.put(("row", p, core.title_from(p, use_tags), core.analyze(p)))
             except Exception as e:
-                self.q.put(("err", p, str(e)))
+                self.q.put(("err", p, f"{type(e).__name__}: {e}"))
         self.q.put(("done",))
 
     def poll(self):
@@ -74,11 +84,15 @@ class App(tk.Tk):
                     self.rows.append(m[1:]); self.refresh(); self.prog.step(1)
                     self.status.config(text=f"Analizados: {len(self.rows)}")
                 elif m[0] == "err":
-                    self.prog.step(1)
+                    self.errors.append((m[1], m[2])); self.prog.step(1)
+                    self.tree.insert("", "end", values=(m[1].name, "—", "—", "ERROR", m[2][:90]))
                 else:
                     self.b_pick.state(["!disabled"])
                     self.b_apply.state(["!disabled" if self.rows else "disabled"])
-                    self.status.config(text=f"Listo: {len(self.rows)} tracks")
+                    self.status.config(text=f"Listo: {len(self.rows)} tracks, {len(self.errors)} con error")
+                    if self.errors and not self.rows:
+                        messagebox.showerror("Track Lab", "No se pudo analizar ningún archivo.\n\nPrimer error:\n"
+                                             f"{self.errors[0][0].name}\n{self.errors[0][1][:300]}")
         except queue.Empty:
             pass
         self.after(100, self.poll)
