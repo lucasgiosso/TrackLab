@@ -27,17 +27,36 @@ KM = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29,
 KN = np.array([6.33, 2.68, 3.52, 5.38, 2.6, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
 
 
+def detect_bpm(y, sr):
+    """BPM con resolucion fina: autocorrelacion + ajuste por tren de pulsos (0.1 BPM)."""
+    hop = 128
+    env = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
+    env = env - env.mean()
+    fps = sr / hop
+    lo, hi = int(fps * 60 / 180), int(fps * 60 / 70)
+    ac = librosa.autocorrelate(env, max_size=2 * hi + 2)
+    score = ac[lo:hi + 1] + 0.5 * ac[2 * lo:2 * hi + 1:2]
+    b0 = 60 * fps / (lo + int(np.argmax(score)))
+    x = np.arange(len(env))
+    best, bpm = -1e18, b0
+    for b in np.arange(b0 - 3, b0 + 3, 0.1):
+        p = 60 * fps / b
+        k = np.arange(int(len(env) / p) - 1)
+        pos = np.arange(0, p, 1.0)[:, None] + k[None, :] * p
+        sc = np.interp(pos, x, env).sum(axis=1).max()
+        if sc > best:
+            best, bpm = sc, b
+    while bpm < 80: bpm *= 2
+    while bpm > 175: bpm /= 2
+    return round(float(bpm), 1)
+
+
 def analyze(path):
     dur = librosa.get_duration(path=str(path))
     y, sr = librosa.load(str(path), sr=22050, mono=True,
                          offset=max(0, (dur - 70) / 2), duration=70)
     # BPM
-    env = librosa.onset.onset_strength(y=y, sr=sr)
-    tempo = librosa.feature.rhythm.tempo(onset_envelope=env, sr=sr)[0] \
-        if hasattr(librosa.feature, "rhythm") else librosa.beat.tempo(onset_envelope=env, sr=sr)[0]
-    bpm = float(tempo)
-    while bpm < 80: bpm *= 2
-    while bpm > 175: bpm /= 2
+    bpm = detect_bpm(y, sr)
     # Tono
     chroma = librosa.feature.chroma_cqt(y=librosa.effects.harmonic(y), sr=sr).mean(axis=1)
     best, res = -9, None
